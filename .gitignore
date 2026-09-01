@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Credentials & sessions — DO NOT commit
+token.json
+.chrome-profile/
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
