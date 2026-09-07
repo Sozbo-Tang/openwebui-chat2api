@@ -110,7 +110,12 @@ def find_chrome() -> str | None:
 
 def browser_login(base_url: str, profile_dir: str, timeout_s: int) -> str:
     """Open a visible Chrome window, wait for the user to sign in, then read
-    the Open WebUI token from localStorage."""
+    the Open WebUI token from localStorage.
+
+    Caveat: localStorage may still hold a token that the backend already
+    invalidated (the frontend clears it a beat later). Any token found here is
+    verified against /api/models; stale ones are removed so a real sign-in
+    can proceed."""
     from playwright.sync_api import sync_playwright  # lazy import
 
     chrome = find_chrome()
@@ -136,12 +141,27 @@ def browser_login(base_url: str, profile_dir: str, timeout_s: int) -> str:
             print(f"[warn] Failed to load page (may still be redirecting): {e}")
 
         deadline = time.time() + timeout_s
+        warned_stale = False
         while time.time() < deadline:
             try:
                 token = page.evaluate("localStorage.getItem('token')")
                 if token:
-                    print("\nSigned in, token acquired.")
-                    return token
+                    # Verify before accepting, otherwise a stale token that the
+                    # frontend has not cleared yet gets mistaken for a login.
+                    status = page.evaluate(
+                        """async t => {
+                            const r = await fetch('/api/models',
+                                {headers: {Authorization: 'Bearer ' + t}});
+                            return r.status;
+                        }""", token)
+                    if status == 200:
+                        print("\nSigned in, token verified.")
+                        return token
+                    if not warned_stale:
+                        warned_stale = True
+                        print("\n[warn] Stale token found in localStorage, "
+                              "clearing it and waiting for a real sign-in...")
+                    page.evaluate("localStorage.removeItem('token')")
             except Exception:
                 pass
             page.wait_for_timeout(1000)
@@ -178,8 +198,18 @@ def authenticate(args) -> dict:
     if args.token:
         return {"token": args.token, "api_key": None}
 
-    if saved and saved.get("token"):
-        return {"token": saved["token"], "api_key": saved.get("api_key")}
+    if saved and (saved.get("api_key") or saved.get("token")):
+        # Validate at startup so we never boot into a 401 retry loop.
+        bearer = saved.get("api_key") or saved.get("token")
+        try:
+            r = requests.get(f"{args.base_url}/api/models",
+                             headers={"Authorization": f"Bearer {bearer}"}, timeout=15)
+            if r.status_code == 200:
+                return {"token": saved.get("token"), "api_key": saved.get("api_key")}
+            print(f"[chat2api] Saved credentials rejected (HTTP {r.status_code}), "
+                  "need to sign in again...")
+        except Exception as e:
+            print(f"[chat2api] Failed to validate saved credentials: {e}")
 
     token = browser_login(args.base_url, args.profile, args.login_timeout)
     api_key = fetch_api_key(args.base_url, token) if args.use_api_key else None
@@ -393,8 +423,10 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                     if raw.strip() == "data: [DONE]":
                         break
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # client disconnected
+        except (BrokenPipeError, ConnectionResetError,
+                requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.ConnectionError):
+            pass  # client disconnected or upstream stream broke
         finally:
             r.close()
             self.close_connection = True
