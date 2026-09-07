@@ -102,6 +102,57 @@ separators (required by strict `eventsource-parser` clients) and terminates
 immediately after `data: [DONE]` (some upstreams keep the connection alive
 otherwise, which makes strict clients hang waiting for end-of-stream).
 
+## Troubleshooting
+
+Real problems hit while building and using this project, and how each was
+solved. If you see the same symptom, the fix is already in the code — this list
+explains *why* the code looks the way it does.
+
+### "Empty response" / the client shows nothing at all (SSE framing)
+
+Strict SSE clients (e.g. the `eventsource-parser` used by several agent
+runtimes) only dispatch an event when it is separated by a blank line. If the
+proxy forwards upstream lines verbatim **without** the separating blank line,
+the parser accumulates every `data:` line into one giant event that fails JSON
+parsing, and the client reports an empty model response with a generic
+`finish_reason`. **Fix:** re-emit each line followed by `\n\n`.
+
+### Output appears only after minutes, then all at once (stream buffering)
+
+If the upstream request is not made in streaming mode, `requests` buffers the
+entire SSE body in memory until the upstream closes the connection. Some
+upstreams keep the connection alive after the response, so nothing gets
+forwarded for minutes. **Fix:** always call the upstream with `stream=True`
+and read line-by-line.
+
+### Client hangs even after receiving `data: [DONE]`
+
+After `[DONE]` some upstreams leave the connection open (keep-alive). Clients
+that read until end-of-stream never see EOF and never render the output.
+**Fix:** stop reading at `[DONE]` and close the downstream connection
+(`Connection: close`).
+
+### "Login successful" but every API call returns 401 (stale token)
+
+`localStorage` can still contain a token the backend has already invalidated —
+the frontend clears it a moment later. Reading it naively makes the login
+"look" successful while every request 401s, looping forever.
+**Fix:** after reading the token, verify it against `/api/models` (accept only
+on `200`; otherwise clear it and wait for a real sign-in). Saved credentials
+are also validated at startup so the server never boots with a dead token.
+
+### Intermittent 502 / upstream drops the stream mid-response (`ChunkedEncodingError`)
+
+Reasoning backends (e.g. vLLM) can drop long-lived streaming connections,
+especially under load — the proxy then surfaces a 5xx to the client. The
+streaming loop now tolerates `ChunkedEncodingError` / `ConnectionError` instead
+of crashing the request handler. A short wait and retry usually succeeds.
+
+### Port 8000 already in use (`OSError: [Errno 48]`)
+
+Another instance of the proxy is already bound to the port. Find and stop it
+first: `lsof -tiTCP:8000 -sTCP:LISTEN | xargs kill`, then start again.
+
 ## License
 
 MIT
